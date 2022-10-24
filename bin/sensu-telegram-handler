@@ -3,7 +3,7 @@
 import requests
 import json
 import click
-
+import os
 #0 = OK = ✅
 #1 = WARNING = ⚠️
 #2 = CRITICAL = 🆘
