@@ -10,20 +10,20 @@ import os
 status_icon = ("✅", "⚠️", "🆘")
 
 @click.command()
-@click.option('--user_id', help='Telegram User ID')
+@click.option('--chat_id', help='Telegram User ID')
 @click.option('--token', default=lambda: os.getenv('TG_TOKEN'), help='Telegram bot api token')
-def main(user_id, token):
+def main(chat_id, token):
     data = click.get_text_stream('stdin').read()
     event = json.loads(data)
     state = event["check"]["state"]
-    status = event["check"]["status"]
+    status = event["check"]["status"] if event["check"]["status"] < 2 else 2
     name = event["check"]["metadata"]["name"]
     entity = event["entity"]["system"]["hostname"]
     output = event["check"]["output"]
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    message = f"{status_icon[status]} Check <b>{name}</b> on host <b>{entity}</b> {state}\n<pre>{output}</pre>"
-    data = {"chat_id": {user_id}, "text": {message}, "parse_mode": "HTML"}
+    message = f"{status_icon[status]} <b>Check {name} on host {entity} {state}</b>\n\n<pre>{output}</pre>"
+    data = {"chat_id": {chat_id}, "text": {message}, "parse_mode": "HTML"}
     r = requests.request("GET", url, data = data)
 #    print (r.json())
 
