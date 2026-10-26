@@ -1,31 +1,127 @@
 #!/usr/bin/env python3
+"""Sensu Go pipe handler: reads an event from stdin and sends it to Telegram."""
 
-import requests
+import argparse
+import html
 import json
-import click
 import os
-#0 = OK = ✅
-#1 = WARNING = ⚠️
-#2 = CRITICAL = 🆘
-status_icon = ("✅", "⚠️", "🆘")
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
 
-@click.command()
-@click.option('--chat_id', help='Telegram User ID')
-@click.option('--token', default=lambda: os.getenv('TG_TOKEN'), help='Telegram bot api token')
-def main(chat_id, token):
-    data = click.get_text_stream('stdin').read()
-    event = json.loads(data)
-    state = event["check"]["state"]
-    status = event["check"]["status"] if event["check"]["status"] < 2 else 2
-    name = event["check"]["metadata"]["name"]
-    entity = event["entity"]["system"]["hostname"]
-    output = event["check"]["output"]
+API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+MAX_LENGTH = 4096  # Telegram message limit
+TRUNCATED = "\n…(truncated)"
+TIMEOUT = 10
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    message = f"{status_icon[status]} <b>Check {name} on host {entity} {state}</b>\n\n<pre>{output}</pre>"
-    data = {"chat_id": {chat_id}, "text": {message}, "parse_mode": "HTML"}
-    r = requests.request("GET", url, data = data)
-#    print (r.json())
+# Sensu status: 0 OK, 1 WARNING, 2 CRITICAL, anything else UNKNOWN
+STATUS_ICONS = {0: "✅", 1: "⚠️", 2: "🆘"}
+UNKNOWN_ICON = "❔"
 
-if __name__ == '__main__':
-    main()
+
+def event_url(dashboard_url: str, namespace: str, entity: str, check: str) -> str:
+    namespace, entity, check = (
+        urllib.parse.quote(p, safe="") for p in (namespace, entity, check)
+    )
+    return f"{dashboard_url.rstrip('/')}/c/~/n/{namespace}/events/{entity}/{check}"
+
+
+def fit_output(output: str, budget: int) -> str:
+    """Escape output, cutting it from the end so it fits into budget chars."""
+    escaped = html.escape(output, quote=False)
+    if len(escaped) <= budget:
+        return escaped
+    budget = max(budget - len(TRUNCATED), 0)
+    cut = budget
+    while True:
+        escaped = html.escape(output[:cut], quote=False)
+        if len(escaped) <= budget:
+            return escaped + TRUNCATED
+        cut = max(cut - (len(escaped) - budget), 0)
+
+
+def build_message(event: dict[str, Any], dashboard_url: str | None = None) -> str:
+    check = event["check"]
+    entity = event["entity"]
+    name = check["metadata"]["name"]
+    entity_name = entity["metadata"]["name"]
+    # Proxy entities have no system info
+    host = entity.get("system", {}).get("hostname") or entity_name
+    icon = STATUS_ICONS.get(check.get("status"), UNKNOWN_ICON)
+
+    state = check.get("state", "")
+    header = (
+        f"{icon} <b>Check {html.escape(name)} on host {html.escape(host)} "
+        f"{html.escape(state)}</b>"
+    )
+    footer = ""
+    if dashboard_url:
+        namespace = check["metadata"].get("namespace", "default")
+        url = event_url(dashboard_url, namespace, entity_name, name)
+        footer = f'\n\n<a href="{html.escape(url)}">Open in Sensu</a>'
+
+    budget = MAX_LENGTH - len(header) - len(footer) - len("\n\n<pre></pre>")
+    output = fit_output(check.get("output", "").strip(), budget)
+    if not output:
+        return header + footer
+    return f"{header}\n\n<pre>{output}</pre>{footer}"
+
+
+def send(token: str, chat_id: str, text: str) -> None:
+    payload = urllib.parse.urlencode(
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": '{"is_disabled": true}',
+        }
+    ).encode()
+    request = urllib.request.Request(API_URL.format(token=token), data=payload)
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT):
+            pass
+    except urllib.error.HTTPError as e:
+        # Telegram explains the error in the response body
+        try:
+            description = json.load(e).get("description", e.reason)
+        except (ValueError, AttributeError):
+            description = e.reason
+        raise RuntimeError(f"Telegram API error {e.code}: {description}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Telegram API unreachable: {e.reason}") from e
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--chat-id", required=True, help="Telegram chat ID to send alerts to"
+    )
+    parser.add_argument(
+        "--dashboard-url", help="Sensu web UI URL, adds an event link to the message"
+    )
+    args = parser.parse_args(argv)
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("TELEGRAM_BOT_TOKEN environment variable is not set", file=sys.stderr)
+        return 1
+
+    try:
+        event = json.load(sys.stdin)
+        text = build_message(event, args.dashboard_url)
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        print(f"Invalid Sensu event: {e!r}", file=sys.stderr)
+        return 1
+
+    try:
+        send(token, args.chat_id, text)
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
